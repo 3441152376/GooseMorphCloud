@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>俄语/乌克兰语 词形分析测试</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="pageContainer">
+      <section class="card">
+        <h1 class="title">词形分析与变形测试</h1>
+        <form id="queryForm" class="formRow" onsubmit="return false;">
+          <div class="field">
+            <label for="word">单词</label>
+            <input id="word" name="word" type="text" placeholder="例如：друг" />
+          </div>
+          <div class="field">
+            <label for="language">语言</label>
+            <select id="language" name="language">
+              <option value="ru">俄语 (ru)</option>
+              <option value="uk">乌克兰语 (uk)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="grammemes">目标语法标签（逗号分隔）</label>
+            <input id="grammemes" name="grammemes" type="text" placeholder="例如：nomn,sing,masc" />
+          </div>
+          <div class="field">
+            <label for="limit">候选上限</label>
+            <input id="limit" name="limit" type="number" min="1" max="32" value="5" />
+          </div>
+          <div class="actions">
+            <button id="btnSmartAnalysis" type="button" class="primary-btn">🔍 智能分析</button>
+            <button id="btnComprehensive" type="button">全面变化</button>
+            <button id="btnPosTagging" type="button">词性标注</button>
+            <button id="btnStemLexeme" type="button">词干词族</button>
+            <button id="btnSpellCheck" type="button">拼写检查</button>
+            <button id="btnNormalForms" type="button">原形查找</button>
+            <button id="btnDecl" type="button">名词变格</button>
+            <button id="btnAdjDecl" type="button">形容词变格</button>
+            <button id="btnVerbConj" type="button">动词变位</button>
+            <button id="btnGet" type="button">GET 查询</button>
+            <button id="btnPost" type="button">POST 查询</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2 class="subtitle">结果</h2>
+        <pre id="result" class="result"></pre>
+        <div id="declension" class="declTableWrap"></div>
+      </section>
+    </main>
+    <script src="/static/viewmodel.js"></script>
+  </body>
+</html>
