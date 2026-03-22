@@ -3,6 +3,17 @@ import os
 
 from pymorphy2 import MorphAnalyzer
 
+# OpenCorpora 将 метать 与 метить 的现在时混在同一词族中，「метаю」类标准形标为 Infr，inflect 默认落到 мечу 词干。
+RU_VERB_LEMMA_LEXEME_PREFER_INFR: frozenset = frozenset({"метать"})
+
+# 体配对无法靠加前缀猜测（词典中会出现伪完成体如 попомогать）；异干动词用显式表。
+RU_VERB_IMPERF_TO_PERF_INFINITIVE: Dict[str, str] = {
+    "помогать": "помочь",
+}
+RU_VERB_PERF_TO_IMPERF_INFINITIVE: Dict[str, str] = {
+    "помочь": "помогать",
+}
+
 PROPER_NOUN_PENALTY: float = 0.45
 ANIMATE_PENALTY: float = 0.05
 INANIMATE_BONUS: float = 0.03
@@ -95,6 +106,44 @@ class MorphologyService:
                 best_score = weight
                 best_parse = parse
         return best_parse
+
+    def _ru_verb_present_indicative_from_lexeme_infr(self, parse: Any, person: str, number: str) -> Optional[str]:
+        """俄语：对 RU_VERB_LEMMA_LEXEME_PREFER_INFR 从 lexeme 取带 Infr 的现在时陈述式，避免 inflect 命中错误词干。"""
+        if self.language != "ru":
+            return None
+        if parse.normal_form.lower() not in RU_VERB_LEMMA_LEXEME_PREFER_INFR:
+            return None
+        try:
+            for fp in parse.lexeme:
+                g = {str(x) for x in fp.tag.grammemes}
+                if not g >= {"VERB", "pres", "indc", person, number}:
+                    continue
+                if "impr" in g:
+                    continue
+                if "Infr" not in g:
+                    continue
+                return fp.word
+        except Exception:
+            pass
+        return None
+
+    def _ru_replace_inflected_with_infr_lexeme_twin(self, parse: Any, inflected: Any) -> Optional[str]:
+        """与 inflect 结果语法标签一致且 lexeme 中存在带 Infr 的词条时，改用该形式（用于不定式按格生成形动词等）。"""
+        if self.language != "ru":
+            return None
+        if parse.normal_form.lower() not in RU_VERB_LEMMA_LEXEME_PREFER_INFR:
+            return None
+        try:
+            ig = {str(x) for x in inflected.tag.grammemes}
+            for fp in parse.lexeme:
+                fg = {str(x) for x in fp.tag.grammemes}
+                if "Infr" not in fg:
+                    continue
+                if ig <= fg:
+                    return fp.word
+        except Exception:
+            pass
+        return None
 
     def analyze(
         self,
@@ -245,6 +294,9 @@ class MorphologyService:
                     inflected = None
                 if inflected is not None:
                     form = inflected.word
+                    twin = self._ru_replace_inflected_with_infr_lexeme_twin(best, inflected)
+                    if twin is not None:
+                        form = twin
                 
                 # 只有当 form 不为 None 时才添加，或者如果还没有该单元格则添加空单元格
                 if form or not existing:
@@ -488,9 +540,11 @@ class MorphologyService:
                 grammemes = ["pres", person, number]
                 form = None
                 try:
-                    inflected = best.inflect(set(grammemes))
-                    if inflected is not None:
-                        form = inflected.word
+                    form = self._ru_verb_present_indicative_from_lexeme_infr(best, person, number)
+                    if form is None:
+                        inflected = best.inflect(set(grammemes))
+                        if inflected is not None:
+                            form = inflected.word
                 except Exception:
                     pass
                 
@@ -820,6 +874,9 @@ class MorphologyService:
                 grammemes_set = {str(g) for g in form_parse.tag.grammemes}
                 # 检查是否是现在时主动形动词
                 if ("PRTF" in grammemes_set or "Part" in str(form_parse.tag)) and "pres" in grammemes_set and "actv" in grammemes_set:
+                    if (self.language == "ru" and best.normal_form.lower() in RU_VERB_LEMMA_LEXEME_PREFER_INFR
+                            and "Infr" not in grammemes_set):
+                        continue
                     case = next((c for c in cases if c in grammemes_set), None)
                     number = next((n for n in numbers if n in grammemes_set), None)
                     gender = next((g for g in genders if g in grammemes_set), None) if number == "sing" else None
@@ -2304,6 +2361,37 @@ class MorphologyService:
         # 这里我们尝试通过词根和常见前缀/后缀来猜测
         
         target_aspect = "perf" if current_aspect == "impf" else "impf"
+        
+        cnf = current_normal_form.lower()
+        if self.language == "ru":
+            if current_aspect == "impf" and cnf in RU_VERB_IMPERF_TO_PERF_INFINITIVE:
+                target_word = RU_VERB_IMPERF_TO_PERF_INFINITIVE[cnf]
+                for p in self.analyzer.parse(target_word):
+                    pos_t = str(p.tag.POS) if hasattr(p.tag, "POS") and p.tag.POS else ""
+                    if pos_t not in ("INFN", "VERB"):
+                        continue
+                    grammemes = {str(g) for g in p.tag.grammemes}
+                    if "perf" in grammemes:
+                        return {
+                            "aspect": "perf",
+                            "word": p.normal_form,
+                            "tag": str(p.tag),
+                            "score": float(p.score),
+                        }
+            if current_aspect == "perf" and cnf in RU_VERB_PERF_TO_IMPERF_INFINITIVE:
+                target_word = RU_VERB_PERF_TO_IMPERF_INFINITIVE[cnf]
+                for p in self.analyzer.parse(target_word):
+                    pos_t = str(p.tag.POS) if hasattr(p.tag, "POS") and p.tag.POS else ""
+                    if pos_t not in ("INFN", "VERB"):
+                        continue
+                    grammemes = {str(g) for g in p.tag.grammemes}
+                    if "impf" in grammemes:
+                        return {
+                            "aspect": "impf",
+                            "word": p.normal_form,
+                            "tag": str(p.tag),
+                            "score": float(p.score),
+                        }
         
         # 常见的体配对模式
         # 完成体 = 未完成体 + 前缀（如：делать -> сделать）
