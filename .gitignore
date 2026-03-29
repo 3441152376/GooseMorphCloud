@@ -5,3 +5,5 @@ __pycache__/
 *.zip
 *.upload.tmp
 ._*
+# 构建脚本可重新下载；仓库以 app/data/ru_verb_aspect_pairs.json 为准
+scripts/RussianVerbsClassification.csv

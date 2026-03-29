@@ -1,18 +1,45 @@
 from typing import List, Optional, Dict, Any, Tuple
+import json
 import os
+from pathlib import Path
 
 from pymorphy2 import MorphAnalyzer
 
 # OpenCorpora 将 метать 与 метить 的现在时混在同一词族中，「метаю」类标准形标为 Infr，inflect 默认落到 мечу 词干。
 RU_VERB_LEMMA_LEXEME_PREFER_INFR: frozenset = frozenset({"метать"})
 
-# 体配对无法靠加前缀猜测（词典中会出现伪完成体如 попомогать）；异干动词用显式表。
+# 体配对无法靠加前缀猜测（词典中会出现伪完成体如 попомогать）；以下为少量手工纠错，会覆盖 JSON 词表中的同名项。
 RU_VERB_IMPERF_TO_PERF_INFINITIVE: Dict[str, str] = {
     "помогать": "помочь",
 }
 RU_VERB_PERF_TO_IMPERF_INFINITIVE: Dict[str, str] = {
     "помочь": "помогать",
 }
+
+
+def _load_ru_verb_aspect_pair_json() -> Tuple[Dict[str, str], Dict[str, str]]:
+    """从 app/data/ru_verb_aspect_pairs.json 加载体配对（由 scripts/build_ru_verb_aspect_pairs.py 自 CoreRussianVerbs CSV 生成）。"""
+    data_path = Path(__file__).resolve().parent.parent / "data" / "ru_verb_aspect_pairs.json"
+    if not data_path.is_file():
+        return {}, {}
+    try:
+        with data_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        raw_imp = payload.get("imperf_to_perf") or {}
+        raw_perf = payload.get("perf_to_imperf") or {}
+        if not isinstance(raw_imp, dict) or not isinstance(raw_perf, dict):
+            return {}, {}
+        imp_to_perf = {str(k).lower(): str(v).lower() for k, v in raw_imp.items()}
+        perf_to_imp = {str(k).lower(): str(v).lower() for k, v in raw_perf.items()}
+        return imp_to_perf, perf_to_imp
+    except Exception:
+        return {}, {}
+
+
+_JSON_IMP_TO_PERF, _JSON_PERF_TO_IMP = _load_ru_verb_aspect_pair_json()
+# 手工表后合并，便于覆盖数据源中个别错误项。
+RU_VERB_ASPECT_IMP_TO_PERF: Dict[str, str] = {**_JSON_IMP_TO_PERF, **RU_VERB_IMPERF_TO_PERF_INFINITIVE}
+RU_VERB_ASPECT_PERF_TO_IMP: Dict[str, str] = {**_JSON_PERF_TO_IMP, **RU_VERB_PERF_TO_IMPERF_INFINITIVE}
 
 PROPER_NOUN_PENALTY: float = 0.45
 ANIMATE_PENALTY: float = 0.05
@@ -2364,8 +2391,9 @@ class MorphologyService:
         
         cnf = current_normal_form.lower()
         if self.language == "ru":
-            if current_aspect == "impf" and cnf in RU_VERB_IMPERF_TO_PERF_INFINITIVE:
-                target_word = RU_VERB_IMPERF_TO_PERF_INFINITIVE[cnf]
+            # 优先：权威配对表（CoreRussianVerbs 等，见 app/data/ru_verb_aspect_pairs.json）
+            if current_aspect == "impf" and cnf in RU_VERB_ASPECT_IMP_TO_PERF:
+                target_word = RU_VERB_ASPECT_IMP_TO_PERF[cnf]
                 for p in self.analyzer.parse(target_word):
                     pos_t = str(p.tag.POS) if hasattr(p.tag, "POS") and p.tag.POS else ""
                     if pos_t not in ("INFN", "VERB"):
@@ -2378,8 +2406,8 @@ class MorphologyService:
                             "tag": str(p.tag),
                             "score": float(p.score),
                         }
-            if current_aspect == "perf" and cnf in RU_VERB_PERF_TO_IMPERF_INFINITIVE:
-                target_word = RU_VERB_PERF_TO_IMPERF_INFINITIVE[cnf]
+            if current_aspect == "perf" and cnf in RU_VERB_ASPECT_PERF_TO_IMP:
+                target_word = RU_VERB_ASPECT_PERF_TO_IMP[cnf]
                 for p in self.analyzer.parse(target_word):
                     pos_t = str(p.tag.POS) if hasattr(p.tag, "POS") and p.tag.POS else ""
                     if pos_t not in ("INFN", "VERB"):
@@ -2392,48 +2420,118 @@ class MorphologyService:
                             "tag": str(p.tag),
                             "score": float(p.score),
                         }
-        
-        # 常见的体配对模式
-        # 完成体 = 未完成体 + 前缀（如：делать -> сделать）
-        prefixes = ["с", "по", "за", "про", "вы", "при", "у", "от", "пере", "на", "о", "об"]
-        
-        candidates = []
-        
-        if current_aspect == "impf":
-            # 未完成体 -> 完成体：尝试添加前缀
-            for prefix in prefixes:
-                candidate = prefix + current_normal_form
-                parses = self.analyzer.parse(candidate)
-                for p in parses:
-                    if "VERB" in str(p.tag) or "INFN" in str(p.tag):
-                        grammemes = {str(g) for g in p.tag.grammemes}
-                        if "perf" in grammemes:
-                            candidates.append({
-                                "aspect": "perf",
-                                "word": p.word,
-                                "tag": str(p.tag),
-                                "score": float(p.score),
-                            })
-        else:
-            # 完成体 -> 未完成体：尝试去掉前缀
-            for prefix in prefixes:
-                if current_normal_form.startswith(prefix) and len(current_normal_form) > len(prefix):
-                    candidate = current_normal_form[len(prefix):]
-                    parses = self.analyzer.parse(candidate)
+
+        # 根本原因：旧逻辑只做“加/去前缀”猜测，无法覆盖：
+        # 1) 异根配对（взять/брать，идти/пойти，класть/положить，купить/покупать）
+        # 2) 需要同时处理“前缀 + 词尾交替”的情况
+        # 因此这里改为：生成规则化派生候选 -> 用 pymorphy2 的 aspect 标签筛选。
+        if self.language == "ru":
+            # 常见动词体前缀（用于 impf->perf 的派生尝试；perf->impf 用于“去前缀”候选）
+            prefixes_add: List[str] = ["с", "по", "за", "про", "вы", "при", "у", "от", "пере", "на", "о", "об", "раз", "воз", "вз", "ис", "со"]
+            prefixes_remove: List[str] = ["по", "с", "за", "про", "вы", "при", "у", "от", "пере", "на", "об", "раз", "воз", "вз", "ис", "со"]
+
+            primary_candidates_words: set[str] = set()
+            fallback_candidates_words: set[str] = set()
+
+            # 只做定向尝试，控制候选数量：
+            # - impf -> perf：优先尝试加前缀
+            # - perf -> impf：优先尝试去前缀
+            if current_aspect == "impf":
+                # --- 主规则：覆盖异干/词尾交替（优先级最高） ---
+                # идти -> пойти
+                if cnf == "идти":
+                    primary_candidates_words.add("пойти")
+                # брать -> взять
+                # брать = бр + ать, взять = вз + ять（通过固定词尾交替还原）
+                if cnf.startswith("брать") and cnf.endswith("рать"):
+                    primary_candidates_words.add("вз" + cnf[1:].replace("рать", "ять"))
+                # класть -> положить
+                if cnf.endswith("класть"):
+                    primary_candidates_words.add("положить")
+                # 注意：不再使用「по-+…ать -> stem+ить」启发式（会误伤 понимать→нимить 等），
+                # покупать/купить 等已由 ru_verb_aspect_pairs.json 覆盖。
+
+                # --- 次规则：前缀派生作为回退 ---
+                for prefix in prefixes_add:
+                    fallback_candidates_words.add(prefix + cnf)
+            else:
+                # --- 主规则：覆盖异干/词尾交替（优先级最高） ---
+                # купить -> покупать
+                if cnf.endswith("ить") and not cnf.startswith("по") and len(cnf) > 3:
+                    stem = cnf[:-3]
+                    primary_candidates_words.add("по" + stem + "ать")
+                # пойти -> идти（по- + йти -> ид-ти）
+                if cnf.startswith("по") and cnf.endswith("йти"):
+                    primary_candidates_words.add("идти")
+                # взять -> брать（вз- + ять -> бр- + ать）
+                if cnf.startswith("вз") and cnf.endswith("ять"):
+                    tail = cnf[2:]
+                    primary_candidates_words.add("бр" + tail.replace("ять", "ать"))
+                # положить -> класть（反向补齐）
+                if cnf == "положить":
+                    primary_candidates_words.add("класть")
+
+                # --- 次规则：前缀去除作为回退 ---
+                for prefix in prefixes_remove:
+                    if cnf.startswith(prefix) and len(cnf) > len(prefix):
+                        fallback_candidates_words.add(cnf[len(prefix):])
+
+            # 遍历候选并在词典中筛出“目标体”，选最高 score
+            def pick_best_from_candidates(candidates_words: set[str]) -> Optional[Dict[str, Any]]:
+                best_local: Optional[Dict[str, Any]] = None
+                best_score: Optional[float] = None
+                best_rank: Optional[int] = None
+
+                def get_candidate_rank(cand_word: str) -> int:
+                    # impf -> perf 的回退候选来自「prefix + cnf」，当 score 相等时优先更常见/更语义接近的前缀。
+                    if current_aspect == "impf":
+                        for idx, prefix in enumerate(prefixes_add):
+                            if cand_word == prefix + cnf:
+                                return idx
+                    return 999
+                for cand_word in candidates_words:
+                    if not cand_word or cand_word == cnf:
+                        continue
+                    try:
+                        parses = self.analyzer.parse(cand_word)
+                    except Exception:
+                        continue
                     for p in parses:
-                        if "VERB" in str(p.tag) or "INFN" in str(p.tag):
-                            grammemes = {str(g) for g in p.tag.grammemes}
-                            if "impf" in grammemes:
-                                candidates.append({
-                                    "aspect": "impf",
-                                    "word": p.word,
-                                    "tag": str(p.tag),
-                                    "score": float(p.score),
-                                })
-        
-        # 返回得分最高的候选
-        if candidates:
-            return max(candidates, key=lambda x: x["score"])
+                        pos_t = str(p.tag.POS) if hasattr(p.tag, "POS") and p.tag.POS else ""
+                        if pos_t not in ("INFN", "VERB"):
+                            continue
+                        grammemes = {str(g) for g in p.tag.grammemes}
+                        if target_aspect not in grammemes:
+                            continue
+                        aspect_pair = {
+                            "aspect": target_aspect,
+                            "word": p.normal_form,
+                            "tag": str(p.tag),
+                            "score": float(p.score),
+                        }
+                        cand_score = aspect_pair["score"]
+                        cand_rank = get_candidate_rank(cand_word)
+                        if best_local is None:
+                            best_local = aspect_pair
+                            best_score = cand_score
+                            best_rank = cand_rank
+                        elif best_score is not None:
+                            # score 更高优先；score 相等时用前缀优先级做稳定裁决
+                            if cand_score > best_score:
+                                best_local = aspect_pair
+                                best_score = cand_score
+                                best_rank = cand_rank
+                            elif abs(cand_score - best_score) < 1e-9 and best_rank is not None and cand_rank < best_rank:
+                                best_local = aspect_pair
+                                best_rank = cand_rank
+                return best_local
+
+            # 优先在主规则候选中选；若没有再用回退候选
+            best_primary = pick_best_from_candidates(primary_candidates_words)
+            if best_primary is not None:
+                return best_primary
+            return pick_best_from_candidates(fallback_candidates_words)
+
         return None
 
     def analyze_root_and_aspect(self, word: str) -> Dict[str, Any]:

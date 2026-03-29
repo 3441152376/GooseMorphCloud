@@ -124,6 +124,14 @@ class RuMorphBroadTests(unittest.TestCase):
         self.assertEqual(pair.get("aspect"), "perf")
         self.assertEqual(pair.get("word"), "сделать")
 
+    def test_ponimat_aspect_pair_ponyat_not_garbage(self) -> None:
+        """体配对来自权威词表，不得退回「нимить」类错误启发式结果。"""
+        pair = _aspect_pair_for_lemma(self.svc, "понимать", "понимать")
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual(pair.get("aspect"), "perf")
+        self.assertEqual(pair.get("word"), "понять")
+
     def test_kapat_conjugation_stable(self) -> None:
         self.assertEqual(_pres_actv_1sg(self.svc, "капать"), "капаю")
 
