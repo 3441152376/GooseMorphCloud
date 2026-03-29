@@ -3,6 +3,9 @@
 
 数据源：https://github.com/StorkST/CoreRussianVerbs （RussianVerbsClassification.csv）
 列「Пара аспектов」格式为：未完成体/完成体（如 понимать/понять）。
+
+同一未完成体若出现多行配对，**先出现的行优先**（避免后行覆盖为错误项，如 говорить/сказать 须优先于 говорить/поговорить）。
+仅当 pymorphy2 能确认左为 impf INFN、右为 perf INFN 时才收录；否则丢弃该行。
 """
 from __future__ import annotations
 
@@ -13,7 +16,6 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-# 与运行时代码使用相同校验逻辑时可选用 pymorphy2；无则仅按 CSV 顺序写入
 try:
     from pymorphy2 import MorphAnalyzer
 
@@ -27,29 +29,32 @@ DEFAULT_CSV_URL = (
 )
 
 
-def _aspect_of_word(word: str) -> Optional[str]:
+def _infn_aspect(word: str) -> Optional[str]:
     if not _analyzer or not word:
         return None
-    best = _analyzer.parse(word)[0]
-    g = {str(x) for x in best.tag.grammemes}
-    if "impf" in g:
-        return "impf"
-    if "perf" in g:
-        return "perf"
+    for prs in _analyzer.parse(word):
+        pos_t = str(prs.tag.POS) if hasattr(prs.tag, "POS") and prs.tag.POS else ""
+        if pos_t != "INFN":
+            continue
+        g = {str(x) for x in prs.tag.grammemes}
+        if "impf" in g:
+            return "impf"
+        if "perf" in g:
+            return "perf"
     return None
 
 
-def _normalize_pair(impf: str, perf: str) -> Optional[Tuple[str, str]]:
-    """若 pymorphy 与 CSV 左右相反则对调；无法识别时信任 CSV 顺序。"""
-    impf, perf = impf.strip().lower(), perf.strip().lower()
-    if not impf or not perf:
+def _normalize_pair_strict(left: str, right: str) -> Optional[Tuple[str, str]]:
+    """仅接受「未完成体 INFN ↔ 完成体 INFN」；与 pymorphy 不一致则丢弃。"""
+    a, b = left.strip().lower(), right.strip().lower()
+    if not a or not b:
         return None
-    ai, ap = _aspect_of_word(impf), _aspect_of_word(perf)
-    if ai == "impf" and ap == "perf":
-        return (impf, perf)
-    if ai == "perf" and ap == "impf":
-        return (perf, impf)
-    return (impf, perf)
+    ai, bi = _infn_aspect(a), _infn_aspect(b)
+    if ai == "impf" and bi == "perf":
+        return (a, b)
+    if ai == "perf" and bi == "impf":
+        return (b, a)
+    return None
 
 
 def parse_csv_rows(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -60,7 +65,6 @@ def parse_csv_rows(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
         header = next(reader, None)
         if not header:
             return imp_to_perf, perf_to_imp
-        # 列名定位（避免硬编码索引漂移）
         try:
             idx_pair = header.index("Пара аспектов")
         except ValueError:
@@ -77,12 +81,17 @@ def parse_csv_rows(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
             left, right = parts[0].strip(), parts[1].strip()
             if not left or not right:
                 continue
-            pair = _normalize_pair(left, right)
+            pair = _normalize_pair_strict(left, right)
             if not pair:
                 continue
-            i, p = pair
-            imp_to_perf[i] = p
-            perf_to_imp[p] = i
+            i_lemma, p_lemma = pair
+            if i_lemma in imp_to_perf:
+                continue
+            imp_to_perf[i_lemma] = p_lemma
+    for i_lemma, p_lemma in imp_to_perf.items():
+        if p_lemma in perf_to_imp:
+            continue
+        perf_to_imp[p_lemma] = i_lemma
     return imp_to_perf, perf_to_imp
 
 
@@ -107,10 +116,9 @@ def main() -> int:
         "pair_count": len(imp_to_perf),
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # 紧凑单行，避免 app/data 下 JSON 体积过大、行数爆炸（仓库约定单文件不宜过长）
     blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
     out_path.write_text(blob, encoding="utf-8")
-    print(f"写入 {out_path}，共 {len(imp_to_perf)} 对。", file=sys.stderr)
+    print(f"写入 {out_path}，共 {len(imp_to_perf)} 对（严格校验 + 未完成体首次出现优先）。", file=sys.stderr)
     return 0
 
 

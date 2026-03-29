@@ -124,13 +124,41 @@ class RuMorphBroadTests(unittest.TestCase):
         self.assertEqual(pair.get("aspect"), "perf")
         self.assertEqual(pair.get("word"), "сделать")
 
+    def test_govorit_aspect_pair_skazat_not_pogovorit(self) -> None:
+        """CSV 中同一未完成体多行配对时先出现者优先（говорить/сказать 先于 говорить/поговорить）。"""
+        pair = _aspect_pair_for_lemma(self.svc, "говорить", "говорить")
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual(pair.get("word"), "сказать")
+
     def test_ponimat_aspect_pair_ponyat_not_garbage(self) -> None:
-        """体配对来自权威词表，不得退回「нимить」类错误启发式结果。"""
+        """понимать/понять 由词表提供（无启发式猜测）。"""
         pair = _aspect_pair_for_lemma(self.svc, "понимать", "понимать")
         self.assertIsNotNone(pair)
         assert pair is not None
         self.assertEqual(pair.get("aspect"), "perf")
         self.assertEqual(pair.get("word"), "понять")
+
+    def test_byt_no_fake_aspect_pair_sbyt(self) -> None:
+        """быть 无词表配对时应为 null（不作前缀猜测）。"""
+        pair = _aspect_pair_for_lemma(self.svc, "быть", "быть")
+        self.assertIsNone(pair)
+
+    def test_znat_aspect_pair_uznat_not_poznat(self) -> None:
+        """знать/узнать 由手工表提供。"""
+        pair = _aspect_pair_for_lemma(self.svc, "знать", "знать")
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual(pair.get("aspect"), "perf")
+        self.assertEqual(pair.get("word"), "узнать")
+
+    def test_zhit_aspect_pair_prozhit_not_szhit(self) -> None:
+        """жить/прожить 由手工表提供。"""
+        pair = _aspect_pair_for_lemma(self.svc, "жить", "жить")
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual(pair.get("aspect"), "perf")
+        self.assertEqual(pair.get("word"), "прожить")
 
     def test_kapat_conjugation_stable(self) -> None:
         self.assertEqual(_pres_actv_1sg(self.svc, "капать"), "капаю")
