@@ -13,6 +13,8 @@ RU_VERB_IMPERF_TO_PERF_INFINITIVE: Dict[str, str] = {
     "помогать": "помочь",
     "знать": "узнать",
     "жить": "прожить",
+    # 与教学常用体一致；合并时覆盖 JSON 中同名键（若上游 CSV 误为 перечувствовать）
+    "чувствовать": "почувствовать",
 }
 
 
@@ -79,8 +81,8 @@ INANIMATE_BONUS: float = 0.03
 NORMAL_FORM_BONUS: float = 0.08
 VERB_BONUS: float = 0.15  # 动词优先权重
 
-# 俄语名词不规则复数纠正表（pymorphy2 词典中部分词给出错误复数，此处覆盖）
-# 键：原形（normal_form）；值：复数六格形式 nomn, gent, datv, accs, ablt, loct
+# 俄语名词：仅当 OpenCorpora 词库中该词没有「并列多套复数」、无法由 lexeme 范式对齐修正时，才用此表覆盖（如 стул 仅有 стулы）。
+# 键：原形（normal_form）；值：复数六格 nomn, gent, datv, accs, ablt, loct
 RU_NOUN_PLURAL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "стул": {"nomn": "стулья", "gent": "стульев", "datv": "стульям", "accs": "стулья", "ablt": "стульями", "loct": "стульях"},
     "дерево": {"nomn": "деревья", "gent": "деревьев", "datv": "деревьям", "accs": "деревья", "ablt": "деревьями", "loct": "деревьях"},
@@ -92,6 +94,105 @@ RU_NOUN_PLURAL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "муж": {"nomn": "мужья", "gent": "мужей", "datv": "мужьям", "accs": "мужей", "ablt": "мужьями", "loct": "мужьях"},
     "перо": {"nomn": "перья", "gent": "перьев", "datv": "перьям", "accs": "перья", "ablt": "перьями", "loct": "перьях"},
 }
+
+# 复数主格常见词尾，用于从 lexeme 中选定的复数主格反推词干，以在「同一词条多套复数」时对齐六格
+RU_NOUN_PLUR_NOMN_STEM_STRIP: frozenset = frozenset("аяыиоеё")
+
+
+def _ru_dedupe_word_list_preserve_order(words: List[str]) -> List[str]:
+    return list(dict.fromkeys(words))
+
+
+def _ru_common_prefix_length(left: str, right: str) -> int:
+    limit: int = min(len(left), len(right))
+    idx: int = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def _ru_pick_plural_nomn_among_lexeme_variants(nomn_candidates: List[str], sing_gent: Optional[str]) -> str:
+    """OpenCorpora 同一 lemma 的 lexeme 中可能并列两套复数（如 чудо→чуда 与 чудеса）。在多个复数主格中择一。"""
+    uniq: List[str] = _ru_dedupe_word_list_preserve_order(nomn_candidates)
+    if not uniq:
+        return ""
+    if len(uniq) == 1:
+        return uniq[0]
+    prefer_diff: List[str] = [w for w in uniq if sing_gent is None or w != sing_gent]
+    if len(prefer_diff) == 1:
+        return prefer_diff[0]
+    if prefer_diff:
+        return max(prefer_diff, key=len)
+    return max(uniq, key=len)
+
+
+def _ru_plural_stem_hint_from_plural_nomn(plural_nomn: str) -> str:
+    if len(plural_nomn) >= 2 and plural_nomn[-1] in RU_NOUN_PLUR_NOMN_STEM_STRIP:
+        return plural_nomn[:-1]
+    return plural_nomn
+
+
+def _ru_pick_plural_case_form_among_variants(
+    case_forms: List[str],
+    plural_stem_hint: str,
+    chosen_plural_nomn: str,
+) -> str:
+    """在同一格多条候选中，优先与选定的复数主格同属一变格行的形式（前缀与 stem_hint 一致）。"""
+    uniq: List[str] = _ru_dedupe_word_list_preserve_order(case_forms)
+    if not uniq:
+        return ""
+    if len(uniq) == 1:
+        return uniq[0]
+    by_prefix: List[str] = [w for w in uniq if w.startswith(plural_stem_hint)]
+    if len(by_prefix) == 1:
+        return by_prefix[0]
+    if len(by_prefix) > 1:
+        return min(by_prefix, key=len)
+    best: str = uniq[0]
+    best_len: int = _ru_common_prefix_length(best, plural_stem_hint)
+    for w in uniq[1:]:
+        score: int = _ru_common_prefix_length(w, plural_stem_hint)
+        if score > best_len:
+            best = w
+            best_len = score
+        elif score == best_len and len(w) < len(best):
+            best = w
+    if best_len == 0:
+        alt_score: int = _ru_common_prefix_length(uniq[0], chosen_plural_nomn)
+        best = uniq[0]
+        for w in uniq[1:]:
+            s2: int = _ru_common_prefix_length(w, chosen_plural_nomn)
+            if s2 > alt_score:
+                best = w
+                alt_score = s2
+    return best
+
+
+def _ru_resolve_plural_row_from_lexeme_buckets(
+    cases: List[str],
+    plur_by_case: Dict[str, List[str]],
+    sing_gent: Optional[str],
+) -> Dict[str, str]:
+    """从 lexeme 收集的复数候选格中解析唯一一套六格；无争议时退化为每格首项。"""
+    cleaned: Dict[str, List[str]] = {c: _ru_dedupe_word_list_preserve_order(plur_by_case.get(c, [])) for c in cases}
+    nomn_list: List[str] = cleaned.get("nomn", [])
+    has_any: bool = any(bool(cleaned[c]) for c in cases)
+    if not has_any:
+        return {}
+    has_multi: bool = len(nomn_list) > 1 or any(len(cleaned[c]) > 1 for c in cases)
+    if not has_multi:
+        return {c: cleaned[c][0] for c in cases if cleaned[c]}
+    chosen_nomn: str = _ru_pick_plural_nomn_among_lexeme_variants(nomn_list, sing_gent)
+    if not chosen_nomn:
+        return {c: cleaned[c][0] for c in cases if cleaned[c]}
+    stem_hint: str = _ru_plural_stem_hint_from_plural_nomn(chosen_nomn)
+    out: Dict[str, str] = {}
+    for c in cases:
+        lst: List[str] = cleaned.get(c, [])
+        if not lst:
+            continue
+        out[c] = _ru_pick_plural_case_form_among_variants(lst, stem_hint, chosen_nomn)
+    return out
 
 
 class MorphologyService:
@@ -282,57 +383,66 @@ class MorphologyService:
         # 这些形式不应出现在标准变格表中，否则会导致每格出现双倍条目（-ие/-ье 混淆等）
         SKIP_TAGS: frozenset = frozenset({"V-be", "V-bi", "Abbr", "Infr"})
 
-        # 对于名词（NOUN）和代词（NPRO），优先使用 lexeme 从词典获取所有形式（含不规则复数，如 стул→стулья）
+        # 对于名词（NOUN）和代词（NPRO），优先使用 lexeme 从词典获取所有形式。
+        # 俄语：同一 lemma 的 lexeme 可能并列多套复数（如 чудо 的 чуда/чудеса），旧逻辑「先出现的复数格」会误选与单数属格同形的 чуда；
+        # 此处对复数六格做范式对齐（见 _ru_resolve_plural_row_from_lexeme_buckets），不依赖逐词纠正表。
+        # 词库仅给出一套错误复数、且无并列候选时仍依赖 RU_NOUN_PLURAL_OVERRIDES（如 стул）。
+        plur_lexeme_bucket: Dict[str, List[str]] = {c: [] for c in cases}
+        sing_gent_from_lexeme: Optional[str] = None
         if pos in ("NOUN", "NPRO"):
             try:
                 lexeme = best.lexeme
-                # 从 lexeme 中提取所有形式
                 for form_parse in lexeme:
                     form_grammemes = {str(g) for g in form_parse.tag.grammemes}
-
-                    # 跳过古语变体（V-be/V-bi）、缩写（Abbr）、口语（Infr）等非标准形式
-                    # 根本原因之一：这些形式曾导致 настроение/понимание 复数每格出现 -ие/-ье 双条目
-                    # 根本原因之二：год 的 lexeme 包含 гг（Abbr）、года复数（Infr）等污染数据
                     if form_grammemes & SKIP_TAGS:
                         continue
-
                     case = next((c for c in cases if c in form_grammemes), None)
                     number = next((n for n in numbers if n in form_grammemes), None)
                     form_gender = next((g for g in ["masc", "femn", "neut"] if g in form_grammemes), gender)
-
-                    if case and number:
-                        # 去重检测：
-                        # - 单数：匹配 case + number + gender（三者均相同才算同一格）
-                        # - 复数：只匹配 case + number（复数本身不分性，存储时 gender=None；
-                        #   旧逻辑的 bug 正在此：复数 cell 存储 gender=None，但比较时
-                        #   form_gender 为 "neut"，导致 None != "neut" → 每个变体都被当作新格）
-                        existing = None
-                        for c in cells:
-                            case_match = c.get("case") == case
-                            number_match = c.get("number") == number
-                            if not (case_match and number_match):
-                                continue
-                            if number == "sing":
-                                # 单数需检查性（gender）
-                                gender_match = (
-                                    c.get("gender") == form_gender
-                                    or (c.get("gender") is None and form_gender is None)
-                                )
-                                if not gender_match:
-                                    continue
-                            # 找到匹配的已有单元格，不重复添加
-                            existing = c
-                            break
-
-                        if not existing:
-                            cells.append({
-                                "case": case,
-                                "number": number,
-                                "gender": form_gender if number == "sing" else None,
-                                "form": form_parse.word,
-                            })
+                    if not (case and number):
+                        continue
+                    if number == "plur":
+                        plur_lexeme_bucket[case].append(form_parse.word)
+                        continue
+                    if case == "gent" and number == "sing":
+                        sing_gent_from_lexeme = form_parse.word
+                    existing = None
+                    for c in cells:
+                        case_match = c.get("case") == case
+                        number_match = c.get("number") == number
+                        if not (case_match and number_match):
+                            continue
+                        gender_match = (
+                            c.get("gender") == form_gender
+                            or (c.get("gender") is None and form_gender is None)
+                        )
+                        if not gender_match:
+                            continue
+                        existing = c
+                        break
+                    if not existing:
+                        cells.append({
+                            "case": case,
+                            "number": number,
+                            "gender": form_gender if number == "sing" else None,
+                            "form": form_parse.word,
+                        })
+                if self.language == "ru":
+                    plur_resolved: Dict[str, str] = _ru_resolve_plural_row_from_lexeme_buckets(
+                        cases, plur_lexeme_bucket, sing_gent_from_lexeme
+                    )
+                    for c in cases:
+                        form_w: Optional[str] = plur_resolved.get(c)
+                        if not form_w:
+                            continue
+                        cells.append({"case": c, "number": "plur", "gender": None, "form": form_w})
+                else:
+                    for c in cases:
+                        lst: List[str] = _ru_dedupe_word_list_preserve_order(plur_lexeme_bucket.get(c, []))
+                        if not lst:
+                            continue
+                        cells.append({"case": c, "number": "plur", "gender": None, "form": lst[0]})
             except Exception:
-                # 如果 lexeme 不可用，回退到标准方法
                 pass
         
         # 标准方法：尝试生成所有格和数的组合
@@ -366,7 +476,7 @@ class MorphologyService:
                     "form": form,
                 })
 
-        # 应用俄语名词不规则复数纠正表（词典中部分词复数错误，如 стул→стулья）
+        # 词库无并列复数范式时的少量兜底（见 RU_NOUN_PLURAL_OVERRIDES 说明）
         if self.language == "ru" and pos == "NOUN":
             nf_lower = best.normal_form.lower()
             if nf_lower in RU_NOUN_PLURAL_OVERRIDES:
